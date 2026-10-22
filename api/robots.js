@@ -1,0 +1,2 @@
+const {origin,live}=require('./_seo');
+module.exports=(req,res)=>{res.setHeader('Content-Type','text/plain; charset=utf-8');res.setHeader('Cache-Control','public, s-maxage=1200');return res.status(200).send(`User-agent: *\nDisallow: /admin.html\nDisallow: /api/\nAllow: /produto/\n${live()?'Allow: /':'# Páginas ainda não liberadas para indexação; controladas por meta noindex.\n'}Sitemap: ${origin()}/sitemap.xml\n`)};
