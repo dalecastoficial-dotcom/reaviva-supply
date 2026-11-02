@@ -11,7 +11,6 @@ const {
 
 const { sign } = require('./_checkout-token');
 
-// Frete-base por estado, em centavos.
 const SHIPPING_BY_STATE = {
   ES: 1490,
   RJ: 1990,
@@ -60,17 +59,18 @@ function money(cents) {
 
 function normalizeOptions(value) {
   if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim());
+    return value.map(item => String(item).trim());
   }
 
   if (typeof value === 'string') {
     try {
       const parsed = JSON.parse(value);
+
       if (Array.isArray(parsed)) {
-        return parsed.map((item) => String(item).trim());
+        return parsed.map(item => String(item).trim());
       }
     } catch (_) {
-      return value.split(',').map((item) => item.trim());
+      return value.split(',').map(item => item.trim());
     }
   }
 
@@ -103,15 +103,15 @@ function calculateShipping(state, quantity) {
     throw new Error('shipping_state_unavailable');
   }
 
-  // Primeira peça: 100% do frete.
-  // Cada peça adicional acrescenta 50% do frete-base.
   return Math.round(baseCents * (1 + 0.5 * (quantity - 1)));
 }
 
 function generateProtocol() {
-  const date = new Date();
-  const year = date.getFullYear();
-  const random = randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+  const year = new Date().getFullYear();
+  const random = randomUUID()
+    .replace(/-/g, '')
+    .slice(0, 8)
+    .toUpperCase();
 
   return `REA-${year}-${random}`;
 }
@@ -138,12 +138,22 @@ module.exports = async function handler(req, res) {
 
     const body = req.body || {};
 
-    // Dados do cliente.
-    const customerName = clean(body.name, 120);
-    const customerPhone = clean(body.phone, 30);
-    const customerEmail = clean(body.email, 160).toLowerCase();
+    // Aceita os nomes reais enviados pelo formulário público.
+    const customerName = clean(
+      body.customer_name || body.name,
+      120
+    );
 
-    // Endereço.
+    const customerPhone = clean(
+      body.customer_phone || body.phone,
+      30
+    );
+
+    const customerEmail = clean(
+      body.customer_email || body.email,
+      160
+    ).toLowerCase();
+
     const cep = clean(body.cep, 9).replace(/\D/g, '');
     const street = clean(body.street, 160);
     const number = clean(body.number, 30);
@@ -152,16 +162,28 @@ module.exports = async function handler(req, res) {
     const city = clean(body.city, 100);
     const state = clean(body.state, 2).toUpperCase();
 
-    // Produto.
-    const productId = clean(body.productId || body.product_id, 50);
+    const productId = clean(
+      body.product_id || body.productId,
+      50
+    );
+
     const size = clean(body.size, 20);
     const color = clean(body.color, 40);
     const quantity = Number(body.quantity);
 
+    // Checkbox HTML pode chegar como "on" ou true.
     const consent =
       body.consent === true ||
       body.privacyConsent === true ||
-      body.customer_agreed === true;
+      body.customer_agreed === true ||
+      body.privacy_agreed === true ||
+      body.privacy_agreed === 'on' ||
+      body.privacy_agreed === 'true';
+
+    // Campo invisível antispam.
+    if (clean(body.website, 200)) {
+      return errorResponse(res, 400, 'invalid_request');
+    }
 
     if (customerName.length < 3) {
       return errorResponse(res, 400, 'invalid_customer_name');
@@ -212,17 +234,19 @@ module.exports = async function handler(req, res) {
       return errorResponse(res, 400, 'privacy_consent_required');
     }
 
-    // Confere o CEP diretamente no servidor.
+    // Valida CEP no servidor.
     const cepData = await lookupCEP(cep);
 
     if (cepData.uf !== state) {
       return errorResponse(res, 400, 'cep_state_mismatch');
     }
 
-    // Consulta o produto diretamente no Supabase.
+    // Consulta produto no banco.
     const products = await db(
       'products',
-      '?select=*&id=eq.' + encodeURIComponent(productId) + '&limit=1'
+      '?select=*&id=eq.' +
+        encodeURIComponent(productId) +
+        '&limit=1'
     );
 
     if (!products || !products.length) {
@@ -231,11 +255,13 @@ module.exports = async function handler(req, res) {
 
     const product = products[0];
 
-    if (product.active === false || product.is_active === false) {
+    if (
+      product.active === false ||
+      product.is_active === false
+    ) {
       return errorResponse(res, 400, 'product_unavailable');
     }
 
-    // Valida tamanho e cor usando as opções cadastradas.
     const availableSizes = normalizeOptions(
       product.sizes || product.available_sizes
     );
@@ -247,7 +273,7 @@ module.exports = async function handler(req, res) {
     if (
       availableSizes.length &&
       !availableSizes.some(
-        (item) => item.toLowerCase() === size.toLowerCase()
+        item => item.toLowerCase() === size.toLowerCase()
       )
     ) {
       return errorResponse(res, 400, 'invalid_product_size');
@@ -256,13 +282,13 @@ module.exports = async function handler(req, res) {
     if (
       availableColors.length &&
       !availableColors.some(
-        (item) => item.toLowerCase() === color.toLowerCase()
+        item => item.toLowerCase() === color.toLowerCase()
       )
     ) {
       return errorResponse(res, 400, 'invalid_product_color');
     }
 
-    // O preço vem do banco, nunca do navegador.
+    // O preço é sempre obtido do banco, nunca do navegador.
     const productPrice = Number(product.price);
 
     if (!Number.isFinite(productPrice) || productPrice <= 0) {
@@ -271,11 +297,14 @@ module.exports = async function handler(req, res) {
 
     const unitPriceCents = amountCents(productPrice);
 
-    if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents <= 0) {
+    if (
+      !Number.isSafeInteger(unitPriceCents) ||
+      unitPriceCents <= 0
+    ) {
       throw new Error('invalid_product_price');
     }
 
-    // Calcula subtotal e frete no servidor.
+    // Calcula os valores em centavos.
     const subtotalCents = unitPriceCents * quantity;
     const shippingCents = calculateShipping(state, quantity);
     const totalCents = subtotalCents + shippingCents;
@@ -284,20 +313,21 @@ module.exports = async function handler(req, res) {
       throw new Error('invalid_order_total');
     }
 
-    // Valores em reais para salvar no pedido.
-    // Esta declaração corrige o erro shipping_cost is not defined.
     const subtotal = money(subtotalCents);
     const shipping_cost = money(shippingCents);
     const total = money(totalCents);
 
     const protocol = generateProtocol();
-    const productName = clean(product.name || product.title, 160);
+    const productName = clean(
+      product.name || product.title,
+      160
+    );
 
     if (!productName) {
       throw new Error('product_name_missing');
     }
 
-    // Primeiro registra o pedido.
+    // 1. Registra o pedido.
     const insertedOrders = await db(
       'orders',
       '?select=id,protocol',
@@ -345,7 +375,7 @@ module.exports = async function handler(req, res) {
 
     const order = insertedOrders[0];
 
-    // Solicita o Pix pelo valor total: produtos + frete.
+    // 2. Solicita Pix à Whitelabel Elite.
     const pix = await provider('/deposit', {
       method: 'POST',
       body: JSON.stringify({
@@ -359,14 +389,21 @@ module.exports = async function handler(req, res) {
       160
     );
 
-    const copyPaste = clean(pix.qrCode?.copyPaste, 5000);
-    const imageUrl = clean(pix.qrCode?.imageUrl, 1000);
+    const copyPaste = clean(
+      pix.qrCode?.copyPaste,
+      5000
+    );
+
+    const imageUrl = clean(
+      pix.qrCode?.imageUrl,
+      1000
+    );
 
     if (!providerChargeId || !copyPaste) {
       throw new Error('provider_invalid_pix_response');
     }
 
-    // Registra a cobrança no Supabase.
+    // 3. Registra cobrança Pix.
     const charges = await db(
       'pix_charges',
       '?select=id',
@@ -395,7 +432,7 @@ module.exports = async function handler(req, res) {
 
     const charge = charges[0];
 
-    // Vincula o identificador da transação ao pedido.
+    // 4. Vincula transação ao pedido.
     await db(
       'orders',
       '?id=eq.' + encodeURIComponent(order.id),
@@ -411,7 +448,7 @@ module.exports = async function handler(req, res) {
       }
     );
 
-    // Token assinado para abrir a página pública de pagamento.
+    // 5. Gera token assinado para a página de pagamento.
     const token = sign(order.id, charge.id);
 
     return json(res, 200, {
@@ -421,13 +458,16 @@ module.exports = async function handler(req, res) {
       shippingCost: shipping_cost,
       amount: total,
       checkoutPath:
-        '/pagamento.html?token=' + encodeURIComponent(token),
+        '/pagamento.html?token=' +
+        encodeURIComponent(token),
     });
+
   } catch (error) {
-    // Detalhes ficam apenas nos logs da Vercel.
     console.error(
       'public_pix_checkout_error',
-      error && error.message ? error.message : 'unknown_error'
+      error && error.message
+        ? error.message
+        : 'unknown_error'
     );
 
     return errorResponse(
