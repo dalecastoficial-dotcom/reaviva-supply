@@ -11,7 +11,7 @@ module.exports = async (req, res) => {
     return json(res, 503, { error: 'pix_disabled' });
   }
 
-  // Valida o token de acesso ao checkout
+  // Valida o token assinado do checkout
   const info = verify(req.query?.token);
 
   if (!info) {
@@ -21,7 +21,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Busca a cobrança vinculada ao token
+    // Busca somente a cobrança vinculada ao token
     const charges = await db(
       'pix_charges',
       '?select=id,order_id,amount_cents,status,qr_code_text,qr_image_url' +
@@ -33,7 +33,9 @@ module.exports = async (req, res) => {
     const charge = charges?.[0];
 
     if (!charge) {
-      return json(res, 404, { error: 'charge_not_found' });
+      return json(res, 404, {
+        error: 'charge_not_found'
+      });
     }
 
     // Busca o pedido correspondente
@@ -47,10 +49,32 @@ module.exports = async (req, res) => {
     const order = orders?.[0];
 
     if (!order) {
-      return json(res, 404, { error: 'order_not_found' });
+      return json(res, 404, {
+        error: 'order_not_found'
+      });
     }
 
-    // Confirmação exige os dois registros consistentes
+    // Confere se cobrança e pedido possuem o mesmo valor
+    const chargeAmount = Number(charge.amount_cents);
+    const orderAmount = Math.round(Number(order.total) * 100);
+
+    if (
+      !Number.isFinite(chargeAmount) ||
+      !Number.isFinite(orderAmount) ||
+      chargeAmount <= 0 ||
+      chargeAmount !== orderAmount
+    ) {
+      console.error('checkout_amount_mismatch', {
+        orderId: order.id,
+        chargeId: charge.id
+      });
+
+      return json(res, 409, {
+        error: 'amount_mismatch'
+      });
+    }
+
+    // Pagamento confirmado somente quando ambos os registros confirmam
     const paid =
       charge.status === 'paid' &&
       order.payment_status === 'pago';
@@ -58,23 +82,35 @@ module.exports = async (req, res) => {
     if (paid) {
       return json(res, 200, {
         protocol: order.protocol || null,
-        amount: charge.amount_cents / 100,
+        amount: chargeAmount / 100,
         status: 'paid',
         qrCode: null
       });
     }
 
-    // Somente cobranças pendentes exibem QR Code
+    // Cobranças que não estão pendentes não exibem QR Code
     if (charge.status !== 'pending') {
       return json(res, 200, {
         protocol: order.protocol || null,
-        amount: charge.amount_cents / 100,
+        amount: chargeAmount / 100,
         status: 'unavailable',
         qrCode: null
       });
     }
 
-    // Aceita somente URLs HTTPS para a imagem
+    // Uma cobrança pendente precisa ter código Pix
+    const copyPaste = String(charge.qr_code_text || '').trim();
+
+    if (!copyPaste) {
+      return json(res, 200, {
+        protocol: order.protocol || null,
+        amount: chargeAmount / 100,
+        status: 'unavailable',
+        qrCode: null
+      });
+    }
+
+    // Aceita somente endereço HTTPS para a imagem do QR Code
     let imageUrl = null;
 
     try {
@@ -89,10 +125,10 @@ module.exports = async (req, res) => {
 
     return json(res, 200, {
       protocol: order.protocol || null,
-      amount: charge.amount_cents / 100,
+      amount: chargeAmount / 100,
       status: 'pending',
       qrCode: {
-        copyPaste: charge.qr_code_text || '',
+        copyPaste,
         imageUrl
       }
     });
